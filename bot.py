@@ -35,7 +35,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 # --- GLOBAL STATE ---
-CODE_VERSION = "s10 (2026-09-17) — Unified GP queue + hard topic-reset repair + per-sender chooser"
+CODE_VERSION = "s12 (2026-09-17) — s11 + in-topic replies, stickers, caption limit, flood retry"
 LOCK_FILE = "vault_bot.lock"
 
 def acquire_lock():
@@ -106,6 +106,7 @@ class QueueState:
         self.topic_name = None       # for #tag captions
         self.mirror = []             # [(partner_chat, partner_thread)] mirror copies
         self.sender_id = None        # admin who sent it (alias lookup)
+        self.hold_until = 0.0        # album landing in progress — flush must wait
         self.processing_msg_ids = []
 
 def get_state(bot_id):
@@ -272,11 +273,61 @@ def tag_line(name):
     t = "".join(c for c in t if c.isalnum() or c == "_")
     return f"📁 #{t}" if t else None
 
+def utf16len(s: str) -> int:
+    """Telegram entity offsets count UTF-16 code units, not Python code points."""
+    return len(s.encode("utf-16-le")) // 2
+
+def shift_entities(ents, shift):
+    """Shift entities by `shift` UTF-16 units, preserving url/user/language/custom_emoji_id
+    (dropping those fields is what caused 'can\'t find field url' send failures)."""
+    out = []
+    for e in ents or []:
+        kw = {"type": e.type, "offset": e.offset + shift, "length": e.length}
+        for f in ("url", "user", "language", "custom_emoji_id"):
+            v = getattr(e, f, None)
+            if v is not None:
+                kw[f] = v
+        out.append(MessageEntity(**kw))
+    return out
+
+def clean_entities(ents):
+    """Drop entities that cannot round-trip through the Bot API."""
+    out = []
+    for e in ents or []:
+        if e.type == "text_link" and not getattr(e, "url", None):
+            continue
+        if e.type == "text_mention" and getattr(e, "user", None) is None:
+            continue
+        if e.type == "custom_emoji" and not getattr(e, "custom_emoji_id", None):
+            continue
+        out.append(e)
+    return out or None
+
 def compose_str(head, tag):
     """Style B: caption + divider + tag."""
     if head and tag:
         return f"{head}\n{DIVIDER}\n{tag}"
     return head or tag
+
+CAP_LIMIT = 1024  # Bot API media caption limit, counted in UTF-16 units
+
+def truncate_cap(s, ents):
+    """Trim caption to Telegram's 1024-unit limit, dropping entities past the cut."""
+    if not s or utf16len(s) <= CAP_LIMIT:
+        return s, ents
+    units = 0
+    cut = len(s)
+    for i, ch in enumerate(s):
+        w = 2 if ord(ch) > 0xFFFF else 1
+        if units + w > CAP_LIMIT - 1:
+            cut = i
+            break
+        units += w
+    s = s[:cut].rstrip() + "…"
+    if ents:
+        lim = utf16len(s)
+        ents = [e for e in ents if e.offset + e.length <= lim]
+    return s, ents or None
 
 def cap_parts(base, base_ents, custom, tag, lead=None):
     """Returns (caption, entities, parse_mode). lead = mirror identity block (prepended)."""
@@ -284,20 +335,22 @@ def cap_parts(base, base_ents, custom, tag, lead=None):
         s = compose_str(custom, tag)
         if lead:
             s = f"{lead}\n\n{s}" if s else lead
+        if utf16len(s) > CAP_LIMIT:
+            s, _ = truncate_cap(s, None)
+            return s, None, None   # plain text: never cut inside an HTML tag
         return s, None, "HTML"
     head = base or ""
     s = compose_str(head, tag)
-    ents = base_ents if head else None
+    ents = clean_entities(base_ents) if head else None
     if lead:
         if s:
             if ents:
-                shift = len(lead) + 2
-                ents = [MessageEntity(type=e.type, offset=e.offset + shift, length=e.length)
-                        for e in ents]
+                ents = shift_entities(ents, utf16len(lead) + 2)
             s = f"{lead}\n\n{s}"
         else:
             s = lead
             ents = None
+    s, ents = truncate_cap(s, ents)
     return s, ents, None
 
 def captioned_obj(msg, custom, tag, lead=None):
@@ -531,7 +584,7 @@ def mirror_lead(alias):
     """Identity block above the caption: identity + divider."""
     return f"{alias}\n{DIVIDER}"
 
-async def alias_for(user_id, bot=None):
+async def alias_for(user_id, bot=None, thread=None):
     """Persistent anonymous identity per user — mirror copies never reveal real names."""
     row = await db_fetchone("SELECT alias FROM aliases WHERE user_id=?", (user_id,))
     if row and is_new_alias(row[0]):
@@ -553,10 +606,13 @@ async def alias_for(user_id, bot=None):
     log.info(f"Alias assigned: user {user_id} -> {alias}")
     if bot is not None:
         try:
+            kw = {"parse_mode": "Markdown"}
+            if thread:
+                kw["message_thread_id"] = thread
             await bot.send_message(
                 user_id, f"Your share alias: *{alias}*\n"
                          "Mirrored copies show this to your partner instead of your name.",
-                parse_mode="Markdown")
+                **kw)
         except TelegramError:
             pass
     return alias
@@ -708,7 +764,7 @@ async def pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     custom = state["settings"]["custom_caption"]
     sender_thread = await topic_thread(context.bot, state, name, sender)
     await send_msgs_grouped(context.bot, sender, sender_thread, msgs, custom, line)
-    alias = await alias_for(sender_id, context.bot)
+    alias = await alias_for(sender_id, context.bot, thread=sender_thread)
     for c in partner_chats(sender):
         t = await topic_thread(context.bot, state, name, c)
         if t is None:
@@ -847,15 +903,31 @@ def help_kb():
          InlineKeyboardButton("🗄 Vault", callback_data="help:vault")],
     ])
 
+async def cmd_reply(update, text, **kwargs):
+    """Command/status reply goes to the SAME topic the command was sent in.
+    Falls back to the user's sticky /use topic, then General; never crashes."""
+    msg = update.effective_message
+    thread = msg.message_thread_id
+    if not thread:
+        state = get_state(update.effective_bot.id)
+        thread = state["manual_topic"].get(msg.from_user.id if msg.from_user else None)
+    if thread:
+        kwargs.setdefault("message_thread_id", thread)
+    try:
+        return await msg.reply_text(text, **kwargs)
+    except TelegramError:
+        kwargs.pop("message_thread_id", None)
+        return await msg.reply_text(text, **kwargs)
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(delete_msg(update.message))
     await auto_sync_topics(context.bot, update.message.from_user.id)
-    m = await update.message.reply_text("🚀 **Vault Active**.", parse_mode="Markdown")
+    m = await cmd_reply(update, "🚀 **Vault Active**.", parse_mode="Markdown")
     asyncio.create_task(delete_msg(m, 5))
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(delete_msg(update.message))
-    m = await update.message.reply_text(HELP_OVERVIEW, parse_mode="Markdown",
+    m = await cmd_reply(update, HELP_OVERVIEW, parse_mode="Markdown",
                                         reply_markup=help_kb())
     asyncio.create_task(delete_msg(m, 60))
 
@@ -884,7 +956,7 @@ async def relay_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(delete_msg(update.message))
     state["settings"]["relay"] = not state["settings"]["relay"]
     status = "ON" if state["settings"]["relay"] else "OFF (in-place mode)"
-    m = await update.message.reply_text(f"Relay & mirror to DM topics: **{status}**", parse_mode='Markdown')
+    m = await cmd_reply(update, f"Relay & mirror to DM topics: **{status}**", parse_mode='Markdown')
     asyncio.create_task(delete_msg(m, 5))
 
 async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -893,7 +965,7 @@ async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.replace("/bind", "", 1).strip()
     if not name:
         cur = binding_for(context.bot.id, update.message.chat_id)
-        m = await update.message.reply_text(
+        m = await cmd_reply(update, 
             f"🔗 Bound here: `{cur}`" if cur else "🔗 This chat is not bound. Use /bind <topic>")
         asyncio.create_task(delete_msg(m, 8))
         return
@@ -903,7 +975,7 @@ async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for c in partner_chats(dest):
         await topic_thread(context.bot, state, name, c)
     if thread is None:
-        m = await update.message.reply_text(
+        m = await cmd_reply(update, 
             "⚠️ **Chat is not a forum yet.** Fix (2 steps):\n"
             "1. @BotFather → your bot → Bot Settings → **Threads Settings** → Threaded Mode **ON**\n"
             "2. In this bot's DM: tap the bot name on top → enable **Topics**\n"
@@ -916,7 +988,7 @@ async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (context.bot.id, update.message.chat_id, name))
     await _db_conn.commit()
     BIND_CACHE[(context.bot.id, update.message.chat_id)] = name
-    m = await update.message.reply_text(f"✅ This chat → topic **{name}**", parse_mode='Markdown')
+    m = await cmd_reply(update, f"✅ This chat → topic **{name}**", parse_mode='Markdown')
     asyncio.create_task(delete_msg(m, 5))
 
 async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -927,7 +999,7 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         (context.bot.id, update.message.chat_id))
     await _db_conn.commit()
     BIND_CACHE.pop((context.bot.id, update.message.chat_id), None)
-    m = await update.message.reply_text("🔓 Binding removed.")
+    m = await cmd_reply(update, "🔓 Binding removed.")
     asyncio.create_task(delete_msg(m, 5))
 
 async def use_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -937,7 +1009,7 @@ async def use_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.message.from_user.id
     if not name:
         state["manual_topic"].pop(uid, None)
-        m = await update.message.reply_text("🧭 Sticky topic cleared.")
+        m = await cmd_reply(update, "🧭 Sticky topic cleared.")
         asyncio.create_task(delete_msg(m, 5))
         return
     sender = update.message.chat_id if update.message.chat_id in config.ADMIN_IDS \
@@ -949,7 +1021,7 @@ async def use_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             bad_chats.append(c)
     if not ok_chats:
-        m = await update.message.reply_text(
+        m = await cmd_reply(update, 
             "⚠️ No DM is forum-ready yet — each user must /start the bot, enable "
             "Threaded Mode in BotFather (Threads Settings) and the Topics toggle in their DM.")
         asyncio.create_task(delete_msg(m, 12))
@@ -961,7 +1033,7 @@ async def use_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if bad_chats:
         txt += ("\n⚠️ Partner DM not ready — they must /start the bot + enable Topics; "
                 "the topic will be created there automatically on first mirror.")
-    m = await update.message.reply_text(txt, parse_mode='Markdown')
+    m = await cmd_reply(update, txt, parse_mode='Markdown')
     asyncio.create_task(delete_msg(m, 8))
 
 async def topics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -976,7 +1048,7 @@ async def topics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
               if b == context.bot.id]
     text = "📚 **Topics**:\n" + ("\n".join(tlines) if tlines else "(none yet)")
     text += "\n\n🔗 **Bindings**:\n" + ("\n".join(blines) if blines else "(none)")
-    m = await update.message.reply_text(text, parse_mode="Markdown")
+    m = await cmd_reply(update, text, parse_mode="Markdown")
     asyncio.create_task(delete_msg(m, 20))
 
 async def trename_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -984,7 +1056,7 @@ async def trename_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(delete_msg(update.message))
     parts = update.message.text.replace("/trename", "", 1).strip().split()
     if len(parts) < 2:
-        m = await update.message.reply_text("Usage: /trename <old> <new>")
+        m = await cmd_reply(update, "Usage: /trename <old> <new>")
         asyncio.create_task(delete_msg(m, 8))
         return
     old, new = parts[0], " ".join(parts[1:])
@@ -992,11 +1064,11 @@ async def trename_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = [(c, t) for (b, c, n), t in TOPIC_CACHE.items()
             if b == context.bot.id and n == old]
     if not rows:
-        m = await update.message.reply_text(f"❌ Topic '{old}' not found.")
+        m = await cmd_reply(update, f"❌ Topic '{old}' not found.")
         asyncio.create_task(delete_msg(m, 8))
         return
     if any(n == new for (b, c, n) in TOPIC_CACHE if b == context.bot.id):
-        m = await update.message.reply_text(f"❌ A topic named '{new}' already exists.")
+        m = await cmd_reply(update, f"❌ A topic named '{new}' already exists.")
         asyncio.create_task(delete_msg(m, 8))
         return
     for c, th in rows:
@@ -1021,7 +1093,7 @@ async def trename_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for u, v in list(st["manual_topic"].items()):
         if v == old:
             st["manual_topic"][u] = new
-    m = await update.message.reply_text(f"✅ Renamed: **{old}** → **{new}**", parse_mode='Markdown')
+    m = await cmd_reply(update, f"✅ Renamed: **{old}** → **{new}**", parse_mode='Markdown')
     asyncio.create_task(delete_msg(m, 5))
 
 async def tdel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1030,7 +1102,7 @@ async def tdel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(delete_msg(update.message))
     name = update.message.text.replace("/tdel", "", 1).strip()
     if not name:
-        m = await update.message.reply_text("Usage: /tdel <topic name>")
+        m = await cmd_reply(update, "Usage: /tdel <topic name>")
         asyncio.create_task(delete_msg(m, 8))
         return
     await ensure_cache()
@@ -1050,7 +1122,7 @@ async def tdel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for u, v in list(st["manual_topic"].items()):
         if v == name:
             st["manual_topic"].pop(u, None)
-    m = await update.message.reply_text(
+    m = await cmd_reply(update, 
         f"📦 **{name}** archived — bot forgot it.\n"
         "The Telegram topic and all its media remain untouched.", parse_mode='Markdown')
     asyncio.create_task(delete_msg(m, 10))
@@ -1064,20 +1136,20 @@ async def migrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if _old_conn:
             cur = await _old_conn.execute("SELECT COUNT(*) FROM media_vault")
             old_c = (await cur.fetchone())[0]
-        m = await update.message.reply_text(
+        m = await cmd_reply(update, 
             f"📊 New vault: `{new_c}`\n⏳ Old db remaining: `{old_c}`\n"
             f"🔁 Migrate: `{'ON' if MIGRATE['on'] else 'OFF'}`", parse_mode="Markdown")
         asyncio.create_task(delete_msg(m, 15))
         return
     if arg in ("on", "off"):
         if arg == "on" and not _old_conn:
-            m = await update.message.reply_text("⚠️ No old DB open.")
+            m = await cmd_reply(update, "⚠️ No old DB open.")
         else:
             MIGRATE["on"] = (arg == "on")
-            m = await update.message.reply_text(f"🔁 Migrate: **{arg.upper()}**", parse_mode='Markdown')
+            m = await cmd_reply(update, f"🔁 Migrate: **{arg.upper()}**", parse_mode='Markdown')
         asyncio.create_task(delete_msg(m, 5))
         return
-    m = await update.message.reply_text("Usage: /migrate on | off | stats")
+    m = await cmd_reply(update, "Usage: /migrate on | off | stats")
     asyncio.create_task(delete_msg(m, 8))
 
 async def gp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1085,7 +1157,7 @@ async def gp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(delete_msg(update.message))
     state["settings"]["auto_group"] = not state["settings"]["auto_group"]
     status = "ON" if state["settings"]["auto_group"] else "OFF"
-    m = await update.message.reply_text(f"Auto-grouper: **{status}**", parse_mode='Markdown')
+    m = await cmd_reply(update, f"Auto-grouper: **{status}**", parse_mode='Markdown')
     asyncio.create_task(delete_msg(m, 5))
 
 async def autodelete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1093,7 +1165,7 @@ async def autodelete_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     asyncio.create_task(delete_msg(update.message))
     state["settings"]["autodelete"] = not state["settings"]["autodelete"]
     status = "ON" if state["settings"]["autodelete"] else "OFF"
-    m = await update.message.reply_text(f"Auto-delete: **{status}**", parse_mode='Markdown')
+    m = await cmd_reply(update, f"Auto-delete: **{status}**", parse_mode='Markdown')
     asyncio.create_task(delete_msg(m, 5))
 
 async def db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1102,7 +1174,7 @@ async def db_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["db_enabled"] = not state["db_enabled"]
     status = "ON" if state["db_enabled"] else "OFF"
     note = "" if state["db_enabled"] else " (still recording stats)"
-    m = await update.message.reply_text(f"Duplicate-check: **{status}**{note}", parse_mode='Markdown')
+    m = await cmd_reply(update, f"Duplicate-check: **{status}**{note}", parse_mode='Markdown')
     asyncio.create_task(delete_msg(m, 5))
 
 async def dbstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1124,7 +1196,7 @@ async def dbstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ORDER BY created_at DESC LIMIT 3""")
     except Exception as e:
         log.error(f"/dbstats query failed: {e}")
-        m = await update.message.reply_text("❌ DB error — check vault_bot.log.")
+        m = await cmd_reply(update, "❌ DB error — check vault_bot.log.")
         asyncio.create_task(delete_msg(m, 8))
         return
 
@@ -1142,7 +1214,7 @@ async def dbstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur = await _old_conn.execute("SELECT COUNT(*) FROM media_vault")
         lines += ["", f"⏳ **Old db remaining:** `{(await cur.fetchone())[0]}`"]
 
-    m = await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    m = await cmd_reply(update, "\n".join(lines), parse_mode="Markdown")
     asyncio.create_task(delete_msg(m, 60))
 
 async def dbclear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1151,10 +1223,10 @@ async def dbclear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _db_conn.execute(
             "UPDATE media_vault SET duplicate_count = 0, last_duplicate_at = NULL")
         await _db_conn.commit()
-        m = await update.message.reply_text("🧹 Stats reset. Hash vault untouched — blocking still active.")
+        m = await cmd_reply(update, "🧹 Stats reset. Hash vault untouched — blocking still active.")
     except Exception as e:
         log.error(f"/dbclear failed: {e}")
-        m = await update.message.reply_text("❌ DB error — check vault_bot.log.")
+        m = await cmd_reply(update, "❌ DB error — check vault_bot.log.")
     asyncio.create_task(delete_msg(m, 8))
 
 # --- INSPECT MODE (/dbfind /dbdel) ---
@@ -1192,21 +1264,21 @@ async def dbfind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f_hash, row = await inspect_lookup(uid)
         except Exception as e:
             log.error(f"/dbfind query failed: {e}")
-            m = await update.message.reply_text("❌ DB error — check vault_bot.log.")
+            m = await cmd_reply(update, "❌ DB error — check vault_bot.log.")
         else:
-            m = await update.message.reply_text(format_find_text(uid, f_hash, row), parse_mode="Markdown")
+            m = await cmd_reply(update, format_find_text(uid, f_hash, row), parse_mode="Markdown")
         asyncio.create_task(delete_msg(m, 20))
         return
     if reply is not None:
         arm_inspect("find", update.message.chat_id, context)
-        m = await update.message.reply_text(
+        m = await cmd_reply(update, 
             "📥 **Find mode ON** — forward the media now (60s).\n"
             "It gets checked WITHOUT being saved, counted, grouped or deleted.",
             parse_mode="Markdown")
         asyncio.create_task(delete_msg(m, 20))
         return
     arm_inspect("find", update.message.chat_id, context)
-    m = await update.message.reply_text(
+    m = await cmd_reply(update, 
         "📥 **Find mode ON** — forward the media now (60s).\n"
         "It gets checked WITHOUT being saved, counted, grouped or deleted.",
         parse_mode="Markdown")
@@ -1221,26 +1293,26 @@ async def dbdel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f_hash, row = await inspect_lookup(uid)
             if row and await delete_record(f_hash):
                 log.info(f"/dbdel removed {short_hash(f_hash)} from vault.")
-                m = await update.message.reply_text(
+                m = await cmd_reply(update, 
                     f"🗑 **Deleted from vault:** `{short_hash(f_hash)}`\n"
                     f"This file will now pass as NEW if sent again.", parse_mode="Markdown")
             else:
-                m = await update.message.reply_text("❌ Not found in vault — nothing deleted.")
+                m = await cmd_reply(update, "❌ Not found in vault — nothing deleted.")
         except Exception as e:
             log.error(f"/dbdel failed: {e}")
-            m = await update.message.reply_text("❌ DB error — check vault_bot.log.")
+            m = await cmd_reply(update, "❌ DB error — check vault_bot.log.")
         asyncio.create_task(delete_msg(m, 10))
         return
     if reply is not None:
         arm_inspect("del", update.message.chat_id, context)
-        m = await update.message.reply_text(
+        m = await cmd_reply(update, 
             "🗑 **Delete mode ON** — forward the media now (60s).\n"
             "Only its vault RECORD is deleted — the media itself is never processed.",
             parse_mode="Markdown")
         asyncio.create_task(delete_msg(m, 20))
         return
     arm_inspect("del", update.message.chat_id, context)
-    m = await update.message.reply_text(
+    m = await cmd_reply(update, 
         "🗑 **Delete mode ON** — forward the media now (60s).\n"
         "Only its vault RECORD is deleted — the media itself is never processed.",
         parse_mode="Markdown")
@@ -1338,14 +1410,14 @@ async def addcaption_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text = update.message.text.replace("/addcaption", "").strip()
     asyncio.create_task(delete_msg(update.message))
     state["settings"]["custom_caption"] = text if text else None
-    m = await update.message.reply_text("✅ Caption updated." if text else "🗑 Caption cleared.")
+    m = await cmd_reply(update, "✅ Caption updated." if text else "🗑 Caption cleared.")
     asyncio.create_task(delete_msg(m, 5))
 
 async def removecaption_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = get_state(context.bot.id)
     asyncio.create_task(delete_msg(update.message))
     state["settings"]["custom_caption"] = None
-    m = await update.message.reply_text("🗑 Caption cleared.")
+    m = await cmd_reply(update, "🗑 Caption cleared.")
     asyncio.create_task(delete_msg(m, 5))
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1362,7 +1434,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- Sticky topic: `{state['manual_topic'].get(update.message.from_user.id) or '—'}`\n"
             f"- Bound here: `{bound}`\n"
             f"- Code: `{CODE_VERSION}`")
-    m = await update.message.reply_text(text, parse_mode='Markdown')
+    m = await cmd_reply(update, text, parse_mode='Markdown')
     asyncio.create_task(delete_msg(m, 10))
 
 # ================= GP ON: QUEUE FLUSHER =================
@@ -1372,6 +1444,11 @@ async def flush_queue_delayed(context: ContextTypes.DEFAULT_TYPE, qkey):
     async with state["album_lock"]:
         q = state["queues"].get(qkey)
         if not q or not q.media:
+            return
+        if time.time() < q.hold_until:
+            # An album is still landing in this destination — wait so it merges
+            # with the pending items (fixes GP-ON "1+2 = 1+2").
+            q.timer_task = asyncio.create_task(flush_queue_delayed(context, qkey))
             return
         m_list = q.media[:]
         ids = q.message_ids[:]
@@ -1564,16 +1641,15 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log.info(f"text mirror: no usable thread (src={src_thread}) in dm {chat_id} "
                      f"— falling back to partner's General")
 
-    alias = await alias_for(msg.from_user.id, context.bot)
+    alias = await alias_for(msg.from_user.id, context.bot,
+                            thread=msg.message_thread_id or
+                            state["manual_topic"].get(msg.from_user.id))
     prefix = mirror_lead(alias)
     body = msg.text if len(msg.text) <= 4000 else msg.text[:4000]
     text = f"{prefix}\n{body}"
-    ents = []
+    ents = None
     if len(body) == len(msg.text) and msg.entities:
-        shift = len(prefix) + 1
-        ents = [MessageEntity(type=e.type, offset=e.offset + shift, length=e.length)
-                for e in msg.entities
-                if e.offset + shift + e.length <= len(text)]
+        ents = shift_entities(clean_entities(msg.entities), utf16len(prefix) + 1)
 
     async def _deliver(c):
         kw = {}
@@ -1601,6 +1677,15 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except TelegramError as e2:
                         log.error(f"text mirror retry to {c} failed: {e2}")
             return False
+        except RetryAfter as e:
+            log.warning(f"FloodWait on text mirror — waiting {e.retry_after}s")
+            await asyncio.sleep(e.retry_after + 1)
+            try:
+                await context.bot.send_message(c, text, **kw)
+                return True
+            except TelegramError as e2:
+                log.error(f"text mirror retry to {c} failed: {e2}")
+                return False
         except TelegramError as e:
             log.error(f"text mirror to {c} failed: {e}")
             return False
@@ -1613,6 +1698,113 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await mirror_warn_once(context.bot, state, chat_id)
     else:
         log.info(f"text mirror delivered: dm={chat_id} topic={topic_name!r}")
+
+# ================= STICKER MIRROR (like text) =================
+async def mirror_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stickers mirror instantly like text: copy to the partner's matching topic.
+    Dup-vault check by file hash (with FloodWait retry). Stickers carry no caption,
+    so the sender's original stays untouched — no clean-copy replace needed."""
+    msg = update.message
+    if not msg or not msg.sticker:
+        return
+    state = get_state(context.bot.id)
+    if not state["settings"]["relay"]:
+        return
+    chat_id = msg.chat_id
+    src_thread = msg.message_thread_id
+    if chat_id not in config.ADMIN_IDS:
+        return
+    partners = partner_chats(chat_id)
+    if not partners:
+        return
+    await ensure_cache()
+    sender_id = msg.from_user.id if msg.from_user else chat_id
+    log.info(f"sticker mirror intake: dm={chat_id} thread={src_thread} from={sender_id}")
+
+    # Same topic resolution as the text mirror
+    topic_name = None
+    if src_thread:
+        topic_name = REV_CACHE.get((context.bot.id, chat_id, src_thread))
+        if not topic_name:
+            row = await db_fetchone(
+                "SELECT name FROM topics WHERE bot_id=? AND chat_id=? AND thread_id=?",
+                (context.bot.id, chat_id, src_thread))
+            if row:
+                topic_name = row[0]
+                REV_CACHE[(context.bot.id, chat_id, src_thread)] = topic_name
+    if not topic_name:
+        manual = state["manual_topic"].get(sender_id)
+        if manual:
+            topic_name = manual
+            log.info(f"sticker mirror: routed via sticky topic {topic_name!r}")
+
+    # Duplicate-vault check (hash of sticker bytes)
+    is_dup = False
+    try:
+        tg_file = await msg.sticker.get_file()
+        data = await tg_file.download_as_bytearray()
+        f_hash = hashlib.sha256(bytes(data)).hexdigest()
+        cursor = await _db_conn.execute(
+            "INSERT OR IGNORE INTO media_vault (file_hash, bot_name, created_at) "
+            "VALUES (?, ?, ?)", (f_hash, bot_label(context.bot), time.time()))
+        is_dup = (cursor.rowcount == 0)
+        if is_dup:
+            await _db_conn.execute(
+                "UPDATE media_vault SET duplicate_count = duplicate_count + 1, "
+                "last_duplicate_at = ? WHERE file_hash = ?", (time.time(), f_hash))
+        await _db_conn.commit()
+    except TelegramError as e:
+        log.error(f"sticker hash failed: {e}")
+    except Exception as e:
+        log.error(f"DB error during sticker dup check: {e}")
+    if is_dup and state["db_enabled"]:
+        log.info("duplicate sticker blocked")
+        try:
+            warn = await context.bot.send_message(
+                chat_id, "🗑️ **Duplicate sticker — skipped.**", parse_mode="Markdown",
+                message_thread_id=src_thread)
+            asyncio.create_task(delete_msg(warn, 3))
+        except TelegramError:
+            pass
+        return
+
+    async def _deliver(c):
+        kw = {}
+        t = await topic_thread(context.bot, state, topic_name, c) if topic_name else None
+        if topic_name and not t:
+            return False
+        if t:
+            kw["message_thread_id"] = t
+        for attempt in range(2):
+            try:
+                await context.bot.send_sticker(c, sticker=msg.sticker.file_id, **kw)
+                return True
+            except BadRequest as e:
+                if t and attempt == 0:
+                    invalidate_thread(context.bot.id, c, topic_name)
+                    t2 = await topic_thread(context.bot, state, topic_name, c)
+                    if t2:
+                        kw["message_thread_id"] = t2
+                        t = t2
+                        continue
+                log.error(f"sticker mirror to {c} failed: {e}")
+                return False
+            except RetryAfter as e:
+                log.warning(f"FloodWait on sticker mirror — waiting {e.retry_after}s")
+                await asyncio.sleep(e.retry_after + 1)
+            except TelegramError as e:
+                log.error(f"sticker mirror to {c} failed: {e}")
+                return False
+        return False
+
+    delivered = False
+    for c in partners:
+        if await _deliver(c):
+            delivered = True
+    if not delivered:
+        await mirror_warn_once(context.bot, state, chat_id)
+    else:
+        log.info(f"sticker mirror delivered: dm={chat_id} topic={topic_name!r}")
 
 # ================= CENTRAL MESSAGE INTAKE =================
 async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1828,6 +2020,11 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- ALBUMS (multi-item, real Telegram media_group_id): batch, then send ---
     if state["settings"]["auto_group"]:
+        # Hold any pending queue flush for this destination so an earlier single
+        # doesn't flush alone before this album's parts join it (fixes 1+2 -> 3).
+        qh = state["queues"].get((chat_id, thread))
+        if qh and qh.media:
+            qh.hold_until = time.time() + config.ALBUM_BATCH_DELAY + 0.5
         mg_id = msg.media_group_id
         if mg_id not in state["gp_albums"]:
             state["gp_albums"][mg_id] = {'m': [], 'ids': [], 'task': None,
@@ -1923,6 +2120,7 @@ async def run_multiple_bots():
         app.add_handler(CommandHandler("addcaption", addcaption_command, filters=admin_filter))
         app.add_handler(CommandHandler("removecaption", removecaption_command, filters=admin_filter))
         app.add_handler(CommandHandler("settings", settings_command, filters=admin_filter))
+        app.add_handler(MessageHandler(admin_filter & filters.Sticker.ALL, mirror_sticker))
         app.add_handler(MessageHandler(admin_filter & ~filters.COMMAND, process_message))
         app.add_handler(MessageHandler(admin_filter & filters.TEXT & ~filters.COMMAND,
                                        process_text), group=1)
