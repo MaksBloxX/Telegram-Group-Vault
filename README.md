@@ -68,6 +68,12 @@ You ──DM──▶ BOT ◀──DM── Friend
 - **Auto-sync + self-healing (s9):** `/start` validates every topic thread in the
   user's DM, recreates dead ones and creates missing ones. All media/text sends
   detect stale threads, recreate the topic once and retry.
+- **s12 fixes:** command/status replies (incl. the one-time "Your share alias"
+  notice) now land in the SAME topic the command/message came from (sticky
+  fallback, then General); stickers mirror instantly like text with dup-vault
+  hash check; media captions auto-truncate to Telegram's 1024-unit limit
+  (entities past the cut are dropped safely); text + sticker mirrors retry
+  after FloodWait instead of failing.
 - **s11 fixes:** GP-ON `1+2` now merges into one group of 3 (queue flush is held
   while an album is still landing); captions with links/custom-emoji no longer
   fail to send (entities keep their `url`/`custom_emoji_id` and are shifted in
