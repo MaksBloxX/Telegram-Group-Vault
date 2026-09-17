@@ -35,7 +35,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 # --- GLOBAL STATE ---
-CODE_VERSION = "s11 (2026-09-17) — s10 + 1+2 merge + entity-safe captions"
+CODE_VERSION = "s10 (2026-09-17) — Unified GP queue + hard topic-reset repair + per-sender chooser"
 LOCK_FILE = "vault_bot.lock"
 
 def acquire_lock():
@@ -106,7 +106,6 @@ class QueueState:
         self.topic_name = None       # for #tag captions
         self.mirror = []             # [(partner_chat, partner_thread)] mirror copies
         self.sender_id = None        # admin who sent it (alias lookup)
-        self.hold_until = 0.0        # album landing in progress — flush must wait
         self.processing_msg_ids = []
 
 def get_state(bot_id):
@@ -273,36 +272,6 @@ def tag_line(name):
     t = "".join(c for c in t if c.isalnum() or c == "_")
     return f"📁 #{t}" if t else None
 
-def utf16len(s: str) -> int:
-    """Telegram entity offsets count UTF-16 code units, not Python code points."""
-    return len(s.encode("utf-16-le")) // 2
-
-def shift_entities(ents, shift):
-    """Shift entities by `shift` UTF-16 units, preserving url/user/language/custom_emoji_id
-    (dropping those fields is what caused 'can\'t find field url' send failures)."""
-    out = []
-    for e in ents or []:
-        kw = {"type": e.type, "offset": e.offset + shift, "length": e.length}
-        for f in ("url", "user", "language", "custom_emoji_id"):
-            v = getattr(e, f, None)
-            if v is not None:
-                kw[f] = v
-        out.append(MessageEntity(**kw))
-    return out
-
-def clean_entities(ents):
-    """Drop entities that cannot round-trip through the Bot API."""
-    out = []
-    for e in ents or []:
-        if e.type == "text_link" and not getattr(e, "url", None):
-            continue
-        if e.type == "text_mention" and getattr(e, "user", None) is None:
-            continue
-        if e.type == "custom_emoji" and not getattr(e, "custom_emoji_id", None):
-            continue
-        out.append(e)
-    return out or None
-
 def compose_str(head, tag):
     """Style B: caption + divider + tag."""
     if head and tag:
@@ -318,11 +287,13 @@ def cap_parts(base, base_ents, custom, tag, lead=None):
         return s, None, "HTML"
     head = base or ""
     s = compose_str(head, tag)
-    ents = clean_entities(base_ents) if head else None
+    ents = base_ents if head else None
     if lead:
         if s:
             if ents:
-                ents = shift_entities(ents, utf16len(lead) + 2)
+                shift = len(lead) + 2
+                ents = [MessageEntity(type=e.type, offset=e.offset + shift, length=e.length)
+                        for e in ents]
             s = f"{lead}\n\n{s}"
         else:
             s = lead
@@ -1402,11 +1373,6 @@ async def flush_queue_delayed(context: ContextTypes.DEFAULT_TYPE, qkey):
         q = state["queues"].get(qkey)
         if not q or not q.media:
             return
-        if time.time() < q.hold_until:
-            # An album is still landing in this destination — wait so it merges
-            # with the pending items (fixes GP-ON "1+2 = 1+2").
-            q.timer_task = asyncio.create_task(flush_queue_delayed(context, qkey))
-            return
         m_list = q.media[:]
         ids = q.message_ids[:]
         c_id = q.chat_id
@@ -1602,9 +1568,12 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prefix = mirror_lead(alias)
     body = msg.text if len(msg.text) <= 4000 else msg.text[:4000]
     text = f"{prefix}\n{body}"
-    ents = None
+    ents = []
     if len(body) == len(msg.text) and msg.entities:
-        ents = shift_entities(clean_entities(msg.entities), utf16len(prefix) + 1)
+        shift = len(prefix) + 1
+        ents = [MessageEntity(type=e.type, offset=e.offset + shift, length=e.length)
+                for e in msg.entities
+                if e.offset + shift + e.length <= len(text)]
 
     async def _deliver(c):
         kw = {}
@@ -1859,11 +1828,6 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- ALBUMS (multi-item, real Telegram media_group_id): batch, then send ---
     if state["settings"]["auto_group"]:
-        # Hold any pending queue flush for this destination so an earlier single
-        # doesn't flush alone before this album's parts join it (fixes 1+2 -> 3).
-        qh = state["queues"].get((chat_id, thread))
-        if qh and qh.media:
-            qh.hold_until = time.time() + config.ALBUM_BATCH_DELAY + 0.5
         mg_id = msg.media_group_id
         if mg_id not in state["gp_albums"]:
             state["gp_albums"][mg_id] = {'m': [], 'ids': [], 'task': None,
